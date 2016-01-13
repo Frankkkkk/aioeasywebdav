@@ -1,5 +1,8 @@
-EasyWebDAV: A WebDAV Client in Python
+aioEasyWebDAV: A WebDAV Client for asyncio Python
 =====================================
+
+This is am aiohttp port of the requests-based EasyWebDAV ( http://github.com/amnong/easywebdav ).
+
 
 Features
 --------
@@ -15,20 +18,20 @@ Installation
 
 Install using distribute:
 
-    easy_install easywebdav
+    easy_install aioeasywebdav
 
 Quick Start
 -----------
 
-    import easywebdav
+    import aioeasywebdav
     # Start off by creating a client object. Username and
     # password may be omitted if no authentication is needed.
-    webdav = easywebdav.connect('webdav.your-domain.com', username='myuser', password='mypass')
+    webdav = aioeasywebdav.connect('webdav.your-domain.com', username='myuser', password='mypass')
     # Do some stuff:
-    webdav.mkdir('some_dir')
-    webdav.rmdir('another_dir')
-    webdav.download('remote/path/to/file', 'local/target/file')
-    webdav.upload('local/path/to/file', 'remote/target/file')
+    await webdav.mkdir('some_dir')
+    await webdav.rmdir('another_dir')
+    await webdav.download('remote/path/to/file', 'local/target/file')
+    await webdav.upload('local/path/to/file', 'remote/target/file')
 
 Client object API
 -----------------
@@ -54,18 +57,18 @@ Using clientside SSL certificate
                                 protocol='https',
                                 cert="/path/to/your/certificate.pem")
     # Do some stuff:
-    print webdav.ls()
+    print(await webdav.ls())
 
 Please note that all options and restriction regarding the "cert" parameter from
 [Requests API](http://docs.python-requests.org/en/latest/api/) apply here as the parameter is only passed through!
 
-Developing EasyWebDAV
+Developing aioEasyWebDAV
 ---------------------
 
 Working with a virtual environment is highly recommended:
 
-    virtualenv --no-site-packages easywebdav_dev
-    source easywebdav_dev/bin/activate
+    virtualenv --no-site-packages aioeasywebdav_dev
+    source aioeasywebdav_dev/bin/activate
 
 Installing the library in development-mode:
 
