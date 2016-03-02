@@ -1,3 +1,6 @@
+# import requests
+import ssl
+import urllib
 import aiohttp
 import platform
 from numbers import Number
@@ -147,7 +150,7 @@ class Client(object):
         await self._send('DELETE', path, 204)
 
     def upload(self, local_path_or_fileobj, remote_path):
-        if isinstance(local_path_or_fileobj, basestring):
+        if isinstance(local_path_or_fileobj, str):
             with open(local_path_or_fileobj, 'rb') as f:
                 self._upload(f, remote_path)
         else:
@@ -158,7 +161,7 @@ class Client(object):
 
     async def download(self, remote_path, local_path_or_fileobj):
         response = await self._send('GET', remote_path, 200, stream=True)
-        if isinstance(local_path_or_fileobj, basestring):
+        if isinstance(local_path_or_fileobj, str):
             with open(local_path_or_fileobj, 'wb') as f:
                 await self._download(f, response)
         else:
@@ -166,7 +169,7 @@ class Client(object):
 
     async def _download(self, fileobj, response):
         while True:
-            chunk = await response.content.read(DOWNLOAD_CHUNK_SIZE_BYTES):
+            chunk = await response.content.read(DOWNLOAD_CHUNK_SIZE_BYTES)
             if not chunk:
                 break
             fileobj.write(chunk)
