@@ -14,9 +14,9 @@ properties = dict(
         "Intended Audience :: Developers",
         "Programming Language :: Python :: 3.5",
         ],
-    description="A straight-forward WebDAV client, implemented using aiohttp",
+    description="A straight-forward WebDAV client, ported from easywebdav to use aiohttp.",
     license="ISC",
-    author="Andrew Leech",
+    author="Andrew Leech, previously Amnon Grossman",
     author_email="andrew@alelec.net",
     url="http://github.com/andrewleech/aioeasywebdav",
     version=__version__,  # noqa
