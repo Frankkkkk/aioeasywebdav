@@ -177,7 +177,7 @@ class Client(object):
                 break
             fileobj.write(chunk)
 
-    async def ls(self, remote_path='.'):
+    async def ls(self, remote_path=''):
         headers = {'Depth': '1'}
         response = await self._send('PROPFIND', remote_path, (207, 301), headers=headers)
 
