@@ -1,11 +1,11 @@
 # import requests
 import ssl
-import urllib
 import aiohttp
 import platform
 from numbers import Number
 import xml.etree.cElementTree as xml
 from collections import namedtuple
+from urllib.request import urlparse
 
 from http.client import responses as HTTP_CODES
 from urllib.parse import urlparse
@@ -31,9 +31,9 @@ def prop(elem, name, default=None):
     return default if child is None else child.text
 
 
-def elem2file(elem):
+def elem2file(elem, basepath=''):
     return File(
-        prop(elem, 'href'),
+        prop(elem, 'href').replace(basepath, ''),
         int(prop(elem, 'getcontentlength', 0)),
         prop(elem, 'getlastmodified', ''),
         prop(elem, 'creationdate', ''),
@@ -71,14 +71,17 @@ class OperationFailed(WebdavException):
 class Client(object):
     def __init__(self, url=None, host=None, port=0, auth=None, username=None, password=None,
                  protocol='http', verify_ssl=True, path=None, cert=None):
+        self.basepath = ''
         if url:
             self.baseurl = url
+            self.basepath = urlparse(url).path
         else:
             if not port:
                 port = 443 if protocol == 'https' else 80
             self.baseurl = '{0}://{1}:{2}'.format(protocol, host, port)
             if path:
                 self.baseurl = '{0}/{1}'.format(self.baseurl, path)
+                self.basepath = path
         self.cwd = '/'
 
         sslcontext = None
@@ -187,7 +190,7 @@ class Client(object):
             return self.ls(url.path)
 
         tree = xml.fromstring(await response.read())
-        return [elem2file(elem) for elem in tree.findall('{DAV:}response')]
+        return [elem2file(elem, self.basepath) for elem in tree.findall('{DAV:}response')]
 
     async def exists(self, remote_path):
         response = await self._send('HEAD', remote_path, (200, 301, 404))
