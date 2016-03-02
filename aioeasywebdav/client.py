@@ -69,13 +69,16 @@ class OperationFailed(WebdavException):
         super(OperationFailed, self).__init__(msg)
 
 class Client(object):
-    def __init__(self, host, port=0, auth=None, username=None, password=None,
+    def __init__(self, url=None, host=None, port=0, auth=None, username=None, password=None,
                  protocol='http', verify_ssl=True, path=None, cert=None):
-        if not port:
-            port = 443 if protocol == 'https' else 80
-        self.baseurl = '{0}://{1}:{2}'.format(protocol, host, port)
-        if path:
-            self.baseurl = '{0}/{1}'.format(self.baseurl, path)
+        if url:
+            self.baseurl = url
+        else:
+            if not port:
+                port = 443 if protocol == 'https' else 80
+            self.baseurl = '{0}://{1}:{2}'.format(protocol, host, port)
+            if path:
+                self.baseurl = '{0}/{1}'.format(self.baseurl, path)
         self.cwd = '/'
 
         sslcontext = None
@@ -89,7 +92,7 @@ class Client(object):
             auth = aiohttp.BasicAuth(username, password=password)
 
         self.session = aiohttp.ClientSession(connector=conn, auth=auth)
-        
+
         # self.session.stream = True
 
     async def _send(self, method, path, expected_code, **kwargs):
