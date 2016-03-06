@@ -21,6 +21,62 @@ class WebdavException(Exception):
 class ConnectionFailed(WebdavException):
     pass
 
+class WebdavProgress(object):
+    STATUS_NEW = "STATUS_NEW"
+    STATUS_ACTIVE = "STATUS_ACTIVE"
+    STATUS_PAUSED = "STATUS_PAUSED"
+    STATUS_DONE = "STATUS_DONE"
+    STATUS_ERROR = "STATUS_ERROR"
+
+    _WINDOW = 20
+
+    def __init__(self):
+        self.future = None
+        self.length = None
+        self.current = 0
+        self.updated = time.time()
+
+        self.enabled = asyncio.Event()
+        self.enabled.set()
+        self._status = self.STATUS_NEW
+        self._tracking = [(0,self.updated)] * self._WINDOW
+
+    @property
+    def status(self):
+        return self._status
+
+    @status.setter
+    def status(self, s):
+        self.updated = time.time()
+        self._status = s
+
+    def add_length(self, size):
+        now = time.time()
+        self.status = self.STATUS_ACTIVE
+
+        self.updated = now
+        self.current += size
+
+        self._tracking.append((self.current, now))
+        self._tracking = self._tracking[1:self._WINDOW+1]
+
+    @property
+    def rate(self):
+        sLen, sTime = self._tracking[0]
+        eLen, eTime = self._tracking[-1]
+        dTime = (eTime - sTime)
+        return 0 if not dTime else (eLen - sLen) / dTime
+
+    async def Pause(self):
+        self.status = self.STATUS_PAUSED
+        self.enabled.clear()
+
+    async def Resume(self):
+        self.enabled.set()
+
+    @property
+    async def Paused(self):
+        return not self.enabled.is_set()
 
 def codestr(code):
     return HTTP_CODES.get(code, 'UNKNOWN')
@@ -169,6 +225,26 @@ class Client(object):
             self._upload(local_path_or_fileobj, remote_path)
 
 
+    async def background_upload(self, local_path, remote_path):
+        """
+        :param str local_path: where to upload file from
+        :param str remote_path: remote file to store to
+        :return: WebdavProgress
+        """
+        progress = WebdavProgress()
+        progress.length = os.path.getsize(local_path)
+
+        def chunk(fh):
+            for dat in fh.read(DOWNLOAD_CHUNK_SIZE_BYTES):
+                progress.add_length(len(dat))
+                yield dat
+
+        with open(local_path, 'rb') as f:
+            cor = self._upload(chunk(f), remote_path)
+
+        progress.future = asyncio.ensure_future(cor)
+        return progress
+
     async def _upload(self, fileobj, remote_path, **kwargs):
         response = await self._send('PUT', remote_path, (200, 201, 204), data=fileobj, **kwargs)
         await response.release()
@@ -181,9 +257,52 @@ class Client(object):
                 await self._download(f, response)
         else:
             await self._download(local_path_or_fileobj, response)
+        await response.release()
 
-    async def _download(self, fileobj, response):
-        while True:
+    async def background_download(self, remote_file, local_path_or_fileobj, done_callback=None):
+        """
+        :param File remote_file: File object from ls()
+        :param (str or file) local_path_or_fileobj: where to download file to
+        :return: WebdavProgress
+        """
+        progress = WebdavProgress()
+        progress.length = remote_file.size
+
+        response = await self._send('GET', remote_file.name, 200, chunked=True)
+        if isinstance(local_path_or_fileobj, str):
+            fileobj = open(local_path_or_fileobj, 'wb')
+            def cb(success):
+                fileobj.close()
+                progress.status = progress.STATUS_DONE if success else progress.STATUS_ERROR
+                if done_callback:
+                    done_callback(success)
+        else:
+            fileobj = local_path_or_fileobj
+            def cb(success):
+                progress.status = progress.STATUS_DONE if success else progress.STATUS_ERROR
+                if done_callback:
+                    done_callback(success)
+
+        cor = self._download(fileobj, response, progress.length, progress.add_length, cb, progress.enabled)
+
+        progress.length = remote_file.size
+        progress.future = asyncio.ensure_future(cor)
+        return progress
+
+    @staticmethod
+    async def _download(fileobj, response, expected_length = 0, progress_callback = None, done_callback=None, enabled_event = None):
+        """
+        :param file fileobj: file handle open for write
+        :param aoihttp.ClientResponse response: open get response (chunked)
+        :param (function or None) progress_callback: optional callback which gets notified of length of each chunk
+        :param (function or None) done_callback: optional callback called when finished with boolean of success
+        :param (asyncio.Event or None) enabled_event: optional Event used to pause/resume download
+        :return:
+        """
+        success = False
+        try:
+            length = 0
+            while not enabled_event or (await enabled_event.wait()):
                 chunk = await response.content.read(DOWNLOAD_CHUNK_SIZE_BYTES)
                 if not chunk:
                     break
