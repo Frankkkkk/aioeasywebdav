@@ -1,5 +1,7 @@
-# import requests
+import os
 import ssl
+import time
+import asyncio
 import aiohttp
 import platform
 from numbers import Number
@@ -11,6 +13,7 @@ from http.client import responses as HTTP_CODES
 from urllib.parse import urlparse
 
 DOWNLOAD_CHUNK_SIZE_BYTES = 1 * 1024 * 1024
+
 
 class WebdavException(Exception):
     pass
@@ -126,7 +129,8 @@ class Client(object):
 
     async def mkdir(self, path, safe=False):
         expected_codes = 201 if not safe else (201, 301, 405)
-        await self._send('MKCOL', path, expected_codes)
+        response = await self._send('MKCOL', path, expected_codes)
+        await response.release()
 
     def mkdirs(self, path):
         dirs = [d for d in path.split('/') if d]
@@ -150,10 +154,12 @@ class Client(object):
     async def rmdir(self, path, safe=False):
         path = str(path).rstrip('/') + '/'
         expected_codes = 204 if not safe else (204, 404)
-        await self._send('DELETE', path, expected_codes)
+        response = await self._send('DELETE', path, expected_codes)
+        await response.release()
 
     async def delete(self, path):
-        await self._send('DELETE', path, 204)
+        response = await self._send('DELETE', path, 204)
+        await response.release()
 
     def upload(self, local_path_or_fileobj, remote_path):
         if isinstance(local_path_or_fileobj, str):
@@ -162,11 +168,14 @@ class Client(object):
         else:
             self._upload(local_path_or_fileobj, remote_path)
 
-    async def _upload(self, fileobj, remote_path):
-        await self._send('PUT', remote_path, (200, 201, 204), data=fileobj)
+
+    async def _upload(self, fileobj, remote_path, **kwargs):
+        response = await self._send('PUT', remote_path, (200, 201, 204), data=fileobj, **kwargs)
+        await response.release()
+
 
     async def download(self, remote_path, local_path_or_fileobj):
-        response = await self._send('GET', remote_path, 200, stream=True)
+        response = await self._send('GET', remote_path, 200, chunked=True)
         if isinstance(local_path_or_fileobj, str):
             with open(local_path_or_fileobj, 'wb') as f:
                 await self._download(f, response)
@@ -175,12 +184,25 @@ class Client(object):
 
     async def _download(self, fileobj, response):
         while True:
-            chunk = await response.content.read(DOWNLOAD_CHUNK_SIZE_BYTES)
-            if not chunk:
-                break
-            fileobj.write(chunk)
+                chunk = await response.content.read(DOWNLOAD_CHUNK_SIZE_BYTES)
+                if not chunk:
+                    break
+                fileobj.write(chunk)
+                length += len(chunk)
+                if progress_callback:
+                    progress_callback(len(chunk))
+            if not expected_length or length == expected_length:
+                success = True
+        finally:
+            await response.release()
+            if done_callback:
+                done_callback(success)
 
     async def ls(self, remote_path=''):
+        """
+        :param str remote_path: path relative to the server to list
+        :return: [File]
+        """
         headers = {'Depth': '1'}
         response = await self._send('PROPFIND', remote_path, (207, 301), headers=headers)
 
@@ -190,8 +212,11 @@ class Client(object):
             return self.ls(url.path)
 
         tree = xml.fromstring(await response.read())
+        await response.release()
         return [elem2file(elem, self.basepath) for elem in tree.findall('{DAV:}response')]
 
     async def exists(self, remote_path):
         response = await self._send('HEAD', remote_path, (200, 301, 404))
-        return True if response.status != 404 else False
+        ret =  True if response.status != 404 else False
+        await response.release()
+        return ret
