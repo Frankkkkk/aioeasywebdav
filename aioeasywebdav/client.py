@@ -1,102 +1,56 @@
 import os
 import ssl
 import time
+import shutil
+import hashlib
 import asyncio
 import aiohttp
 import platform
+import threading
+from abc import ABCMeta, abstractmethod
 from numbers import Number
 import xml.etree.cElementTree as xml
 from collections import namedtuple
-from urllib.request import urlparse
+from urllib.parse import urlparse, quote, unquote
 
 from http.client import responses as HTTP_CODES
-from urllib.parse import urlparse
 
 DOWNLOAD_CHUNK_SIZE_BYTES = 1 * 1024 * 1024
+TEMP_NAME='.part'
 
 
 class WebdavException(Exception):
     pass
 
+
 class ConnectionFailed(WebdavException):
     pass
 
-class WebdavProgress(object):
-    STATUS_NEW = "STATUS_NEW"
-    STATUS_ACTIVE = "STATUS_ACTIVE"
-    STATUS_PAUSED = "STATUS_PAUSED"
-    STATUS_DONE = "STATUS_DONE"
-    STATUS_ERROR = "STATUS_ERROR"
-
-    _WINDOW = 20
-
-    def __init__(self):
-        self.future = None
-        self.length = None
-        self.current = 0
-        self.updated = time.time()
-
-        self.enabled = asyncio.Event()
-        self.enabled.set()
-        self._status = self.STATUS_NEW
-        self._tracking = [(0,self.updated)] * self._WINDOW
-
-    @property
-    def status(self):
-        return self._status
-
-    @status.setter
-    def status(self, s):
-        self.updated = time.time()
-        self._status = s
-
-    def add_length(self, size):
-        now = time.time()
-        self.status = self.STATUS_ACTIVE
-
-        self.updated = now
-        self.current += size
-
-        self._tracking.append((self.current, now))
-        self._tracking = self._tracking[1:self._WINDOW+1]
-
-    @property
-    def rate(self):
-        sLen, sTime = self._tracking[0]
-        eLen, eTime = self._tracking[-1]
-        dTime = (eTime - sTime)
-        return 0 if not dTime else (eLen - sLen) / dTime
-
-    async def Pause(self):
-        self.status = self.STATUS_PAUSED
-        self.enabled.clear()
-
-    async def Resume(self):
-        self.enabled.set()
-
-    @property
-    async def Paused(self):
-        return not self.enabled.is_set()
 
 def codestr(code):
     return HTTP_CODES.get(code, 'UNKNOWN')
 
 
-File = namedtuple('File', ['name', 'size', 'mtime', 'ctime', 'contenttype'])
+File = namedtuple('File', ['name', 'size', 'mtime', 'ctime', 'contenttype', 'checksum'])
 
 
-def prop(elem, name, default=None):
-    child = elem.find('.//{DAV:}' + name)
+def prop(elem, name, default=None, ns='{DAV:}'):
+    child = elem.find('.//' + ns + name)
     return default if child is None else child.text
 
 
 def elem2file(elem, basepath=''):
+    length = prop(elem, 'getcontentlength', 0)
     return File(
-        prop(elem, 'href').replace(basepath, ''),
-        int(prop(elem, 'getcontentlength', 0)),
+        unquote(prop(elem, 'href').replace(basepath, '')),
+        int(length) if length else 0,
         prop(elem, 'getlastmodified', ''),
         prop(elem, 'creationdate', ''),
         prop(elem, 'getcontenttype', ''),
+        # Owncloud Webdav checksum support. Unsure if regular owncloud client creates the checksum, if not refer to:
+        # https://github.com/owncloud/core/pull/21997#issuecomment-176972659
+        # Silently ignored on other webdav servers.
+        prop(elem, 'checksum', None, ns='{http://owncloud.org/ns}'),
     )
 
 
@@ -127,9 +81,34 @@ class OperationFailed(WebdavException):
   Actual code   :  {actual_code} {actual_code_str}'''.format(**locals())
         super(OperationFailed, self).__init__(msg)
 
+
+class ProgressHandler(object):
+    __metaclass__ = ABCMeta
+
+    @abstractmethod
+    async def progress_callback(self, total_size, current_size):
+        """
+        :param int total_size: Eventual total size of the file
+        :param int current_size: Current downloaded size of the file
+        :return: None
+        """
+        pass
+
+    @abstractmethod
+    async def done_callback(self, error):
+        """
+        :param (str | None) error: Error string if there was an issue or None
+        :return: None
+        """
+        pass
+
+
 class Client(object):
+
     def __init__(self, url=None, host=None, port=0, auth=None, username=None, password=None,
-                 protocol='http', verify_ssl=True, path=None, cert=None):
+                 protocol='http', verify_ssl=True, path=None, cert=None, max_connections=75):
+        self._max_connections = max_connections
+
         self.basepath = ''
         if url:
             self.baseurl = url
@@ -148,14 +127,43 @@ class Client(object):
             self.session.cert = cert
 
             sslcontext = ssl.create_default_context(cafile=cert)
-        conn = aiohttp.TCPConnector(ssl_context=sslcontext, verify_ssl=verify_ssl)
+        conn = aiohttp.TCPConnector(ssl_context=sslcontext, verify_ssl=verify_ssl, limit=self._max_connections)
 
         if not auth and username and password:
             auth = aiohttp.BasicAuth(username, password=password)
 
         self.session = aiohttp.ClientSession(connector=conn, auth=auth)
 
-        # self.session.stream = True
+        self._rate_ave_period = 2  # approx period in seconds over which the download rate it averaged
+        self._download_rates = {}
+        self._rate_tracking = {}
+        self._rate_calc_future = asyncio.ensure_future(self._rate_calc())
+
+    async def _rate_calc(self):
+        prev = time.time() - self._rate_ave_period
+        while True:
+            now = time.time()
+            for name, downloaded in self._rate_tracking.items():
+                # assert isinstance(entry, self._rate_tracking_entry)
+                period = now - prev
+                # moving = self._download_rates.get(name, 0)
+                # moving = moving + downloaded - moving/period
+                # self._download_rates[name] = moving
+                self._download_rates[name] = downloaded / period
+                self._rate_tracking[name] = 0
+            prev = now
+            await asyncio.sleep(self._rate_ave_period)
+
+    def _rate_notify(self, name, downloaded):
+        self._rate_tracking[name] = self._rate_tracking.get(name, 0) + downloaded
+        self._rate_tracking[None] = self._rate_tracking.get(None, 0) + downloaded
+
+    def download_rate(self, name = None):
+        """
+        :param (str or None) name: filename or None for global rate
+        :return: download rate in bytes per second
+        """
+        return self._download_rates.get(name, 0)# / self._rate_ave_period
 
     async def _send(self, method, path, expected_code, **kwargs):
         url = self._get_url(path)
@@ -166,7 +174,7 @@ class Client(object):
         return response
 
     def _get_url(self, path):
-        path = str(path).strip()
+        path = quote(str(path).strip())
         if path.startswith('/'):
             return self.baseurl + path
         return "".join((self.baseurl, self.cwd, path))
@@ -214,6 +222,11 @@ class Client(object):
         await response.release()
 
     async def delete(self, path):
+        """
+        :param (File | str) path: path from server root or File object to delete
+        :return: None
+        """
+        path = path.name if isinstance(path, File) else path
         response = await self._send('DELETE', path, 204)
         await response.release()
 
@@ -224,98 +237,189 @@ class Client(object):
         else:
             self._upload(local_path_or_fileobj, remote_path)
 
-
-    async def background_upload(self, local_path, remote_path):
-        """
-        :param str local_path: where to upload file from
-        :param str remote_path: remote file to store to
-        :return: WebdavProgress
-        """
-        progress = WebdavProgress()
-        progress.length = os.path.getsize(local_path)
-
-        def chunk(fh):
-            for dat in fh.read(DOWNLOAD_CHUNK_SIZE_BYTES):
-                progress.add_length(len(dat))
-                yield dat
-
-        with open(local_path, 'rb') as f:
-            cor = self._upload(chunk(f), remote_path)
-
-        progress.future = asyncio.ensure_future(cor)
-        return progress
-
     async def _upload(self, fileobj, remote_path, **kwargs):
-        response = await self._send('PUT', remote_path, (200, 201, 204), data=fileobj, **kwargs)
+        local_hash = await loop.run_in_executor(None, self._md5, fileobj)
+        headers = {"OC-Checksum" : "MD5:%s" % local_hash}
+        response = await self._send('PUT', remote_path, (200, 201, 204), data=fileobj, headers=headers, **kwargs)
         await response.release()
 
+    async def _check_existing_download(self, fileobj, remote_file, start):
+        overlap = 16
+        length = fileobj.seek(0, os.SEEK_END)
+        valid = False if length else True
+        if length:
+            pos = fileobj.seek(-overlap, os.SEEK_CUR) + start
+            tail = fileobj.read()
+            rsp = await self._send('GET', remote_file.name, (200,206), headers={"Range": "bytes=%d-%d"%(pos,pos+overlap-1)})
+            read = await rsp.content.read()
+            if read == tail:
+                valid = True
+            else:
+                fileobj.seek(0)
+            await rsp.release()
+        return valid
 
-    async def download(self, remote_path, local_path_or_fileobj):
-        response = await self._send('GET', remote_path, 200, chunked=True)
-        if isinstance(local_path_or_fileobj, str):
-            with open(local_path_or_fileobj, 'wb') as f:
-                await self._download(f, response)
-        else:
-            await self._download(local_path_or_fileobj, response)
-        await response.release()
+    async def _download_stream(self, local_path, part_path, remote_file, start, end, progress_callback = None, enabled_event = None):
+        response = None
+        finished = False
+        pos = existing = 0
+        while not finished:
+            try:
+                exists = os.path.exists(part_path)
+                mode = 'r+b' if exists else 'w+b'
 
-    async def background_download(self, remote_file, local_path_or_fileobj, done_callback=None):
-        """
-        :param File remote_file: File object from ls()
-        :param (str or file) local_path_or_fileobj: where to download file to
-        :return: WebdavProgress
-        """
-        progress = WebdavProgress()
-        progress.length = remote_file.size
+                if enabled_event:
+                    await enabled_event.wait()
 
-        response = await self._send('GET', remote_file.name, 200, chunked=True)
-        if isinstance(local_path_or_fileobj, str):
-            fileobj = open(local_path_or_fileobj, 'wb')
-            def cb(success):
-                fileobj.close()
-                progress.status = progress.STATUS_DONE if success else progress.STATUS_ERROR
-                if done_callback:
-                    done_callback(success)
-        else:
-            fileobj = local_path_or_fileobj
-            def cb(success):
-                progress.status = progress.STATUS_DONE if success else progress.STATUS_ERROR
-                if done_callback:
-                    done_callback(success)
+                with open(part_path, mode) as fileobj:
 
-        cor = self._download(fileobj, response, progress.length, progress.add_length, cb, progress.enabled)
+                    if exists:
+                        await self._check_existing_download(fileobj, remote_file, start)
+                    pos = existing = fileobj.tell()
+                    await progress_callback(part_path, pos)
+                    req_start = start + pos
+                    if req_start >= end:
+                        finished = True
 
-        progress.length = remote_file.size
-        progress.future = asyncio.ensure_future(cor)
-        return progress
+                if not isinstance(end, int) or req_start < end:
+
+                    header = {"Range": "bytes=%s-%s"%(req_start,end)}
+                    response = await self._send('GET', remote_file.name, (200,206), chunked=True, headers=header)
+
+                    while True:
+                        if enabled_event and not enabled_event.is_set():
+                            if response:
+                                response.close()
+                                await response.release()
+                                response = None
+                            await asyncio.sleep(3) # Rate limiting
+                            break
+                        chunk = await response.content.read(DOWNLOAD_CHUNK_SIZE_BYTES)
+                        if not chunk:
+                            finished = True
+                            break
+
+                        self._rate_notify(local_path, len(chunk))
+
+                        with open(part_path, 'r+b') as fileobj:
+                            fileobj.seek(pos)
+                            length = len(chunk)
+                            fileobj.write(chunk)
+                            pos += length
+                            if progress_callback:
+                                await progress_callback(part_path, pos)
+
+            except Exception as ex:
+                await asyncio.sleep(3) # Rate limiting
+                raise  # somewhere to breakpoint
+            finally:
+                if response:
+                    response.close()
+                    await response.release()
+                    response = None
+        return part_path, pos - existing
 
     @staticmethod
-    async def _download(fileobj, response, expected_length = 0, progress_callback = None, done_callback=None, enabled_event = None):
+    def join_parts(local_path, partfiles):
+        # Join all parts together
+        with open(local_path, 'wb') as local_file:
+            for part in partfiles:
+                with open(part, 'rb') as partfile:
+                    shutil.copyfileobj(partfile, local_file)
+        for part in partfiles:
+            os.unlink(part)
+
+    @staticmethod
+    def md5(fname):
+        with open(fname, "rb") as f:
+            return Client._md5(f)
+
+    @staticmethod
+    def _md5(fileobj):
+        start = fileobj.tell()
+        hash_md5 = hashlib.md5()
+        for chunk in iter(lambda: fileobj.read(65535), b""):
+            hash_md5.update(chunk)
+        fileobj.seek(start)
+        return hash_md5.hexdigest()
+
+    async def download(self, local_path, remote_file, progress_handler = None, enabled_event = None):
         """
-        :param file fileobj: file handle open for write
-        :param aoihttp.ClientResponse response: open get response (chunked)
-        :param (function or None) progress_callback: optional callback which gets notified of length of each chunk
-        :param (function or None) done_callback: optional callback called when finished with boolean of success
+        :param str local_path: path to write local file
+        :param File remote_file: remote file description as returned by ls
+        :param (ProgressHandler or None) progress_handler: optional class of callbacks which gets notified of progress
         :param (asyncio.Event or None) enabled_event: optional Event used to pause/resume download
         :return:
         """
-        success = False
+        error = 'Unknown'
+        responses = []
+        cur_lengths = {}
+        loop = asyncio.get_event_loop()
+
         try:
-            length = 0
-            while not enabled_event or (await enabled_event.wait()):
-                chunk = await response.content.read(DOWNLOAD_CHUNK_SIZE_BYTES)
-                if not chunk:
-                    break
-                fileobj.write(chunk)
-                length += len(chunk)
-                if progress_callback:
-                    progress_callback(len(chunk))
-            if not expected_length or length == expected_length:
-                success = True
+            dirname = os.path.dirname(local_path)
+            if not os.path.exists(dirname):
+                os.makedirs(dirname)
+
+            expected_length = remote_file.size
+
+            chunksize = (10*1000*1000)
+            chunks = [(idx, rng, rng + chunksize-1) for idx, rng in enumerate(range(0, remote_file.size, chunksize))]
+
+            if chunks:
+
+                partname = "%s.{}%s" % (local_path, TEMP_NAME)
+                chunks[-1] = (chunks[-1][0],chunks[-1][1], expected_length)
+                range_details = [(partname.format(str(i)),start,end) for i,start,end in chunks]
+
+                if isinstance(progress_handler, ProgressHandler):
+                    async def progress_callback(part_path, cur_length):
+                        cur_lengths[part_path] = cur_length
+                        await progress_handler.progress_callback(expected_length, sum(cur_lengths.values()))
+                else:
+                    progress_callback = None
+
+                downloads = [self._download_stream(local_path, part_path, remote_file, start, end, progress_callback, enabled_event)
+                             for part_path, start, end in range_details]
+                responses = await asyncio.gather(*downloads)
+
+            partfiles = [part for part, dl_size in responses]
+
+            local_temp = local_path + TEMP_NAME
+            if not expected_length or \
+                    (sum([os.path.getsize(f) for f in partfiles]) == expected_length and len(partfiles) == len(chunks)):
+                error = None
+                if len(chunks) > 1:
+                    await loop.run_in_executor(None, self.join_parts, local_temp, partfiles)
+                else:
+                    os.rename(partfiles[0], local_temp)
+
+            if remote_file.checksum:
+                kind,hash = remote_file.checksum.split(":")
+                local_hash = None
+                if kind == 'MD5':
+                    local_hash = await loop.run_in_executor(None, self.md5, local_temp)
+                if local_hash != hash:
+                    error = "Invalid Checksum, expected: %s" % str(remote_file.checksum)
+                    os.rename(local_temp, local_path+".invalid")
+
+            if not error:
+                os.rename(local_temp, local_path)
+
+        except Exception as ex:
+            tb = __import__('traceback').format_exc()
+            error = str(ex)
+            if not error:
+                error = type(ex)
+
         finally:
-            await response.release()
-            if done_callback:
-                done_callback(success)
+            if isinstance(progress_handler, ProgressHandler):
+                await progress_handler.done_callback(error)
+            if local_path in self._rate_tracking:
+                del self._rate_tracking[local_path]
+            if local_path in self._download_rates:
+                del self._download_rates[local_path]
+        return error
 
     async def ls(self, remote_path=''):
         """
@@ -323,7 +427,17 @@ class Client(object):
         :return: [File]
         """
         headers = {'Depth': '1'}
-        response = await self._send('PROPFIND', remote_path, (207, 301), headers=headers)
+        checksum_prop = """<?xml version="1.0"?>
+        <a:propfind xmlns:a="DAV:">
+            <a:prop xmlns:oc="http://owncloud.org/ns">
+                <oc:checksums/>
+                <a:getcontentlength/>
+                <a:getlastmodified/>
+                <a:creationdate/>
+                <a:getcontenttype/>
+            </a:prop>
+        </a:propfind>"""
+        response = await self._send('PROPFIND', remote_path, (207, 301), headers=headers, data=checksum_prop)
 
         # Redirect
         if response.status == 301:
@@ -332,7 +446,8 @@ class Client(object):
 
         tree = xml.fromstring(await response.read())
         await response.release()
-        return [elem2file(elem, self.basepath) for elem in tree.findall('{DAV:}response')]
+        entries = [elem2file(elem, self.basepath) for elem in tree.findall('{DAV:}response')]
+        return entries
 
     async def exists(self, remote_path):
         response = await self._send('HEAD', remote_path, (200, 301, 404))

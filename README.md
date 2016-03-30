@@ -1,5 +1,5 @@
-aioEasyWebDAV: A WebDAV Client for asyncio Python
-=====================================
+aioEasyWebDAV: A WebDAV Client for Python 3.5 asyncio
+=====================================================
 
 This is am aiohttp port of the requests-based EasyWebDAV ( http://github.com/amnong/easywebdav ).
 
@@ -18,20 +18,26 @@ Installation
 
 Install using distribute:
 
-    easy_install aioeasywebdav
+    pip install aioeasywebdav
 
 Quick Start
 -----------
 
     import aioeasywebdav
+    loop = asyncio.get_event_loop()
+    
     # Start off by creating a client object. Username and
     # password may be omitted if no authentication is needed.
     webdav = aioeasywebdav.connect('webdav.your-domain.com', username='myuser', password='mypass')
+    
     # Do some stuff:
-    await webdav.mkdir('some_dir')
-    await webdav.rmdir('another_dir')
-    await webdav.download('remote/path/to/file', 'local/target/file')
-    await webdav.upload('local/path/to/file', 'remote/target/file')
+    loop.run_until_complete(webdav.mkdir('some_dir'))
+    loop.run_until_complete(webdav.rmdir('another_dir'))
+    
+    async def fn():
+        await webdav.download('/remote/path/to/file', '/local/target/file')
+        await webdav.upload('/local/path/to/file', '/remote/target/file')
+    loop.run_until_complete(fn())
 
 Client object API
 -----------------
@@ -46,12 +52,12 @@ The API is pretty much self-explanatory:
     rmdir(path, safe=False)
     delete(file_path)
     upload(local_path_or_fileobj, remote_path)
-    download(remote_path, local_path_or_fileobj)
+    download(remote_path, local_path)
 
 Using clientside SSL certificate
 --------------------------------
 
-    webdav = easywebdav.connect('secure.example.net',
+    webdav = aioeasywebdav.connect('secure.example.net',
                                 username='user',
                                 password='pass',
                                 protocol='https',
