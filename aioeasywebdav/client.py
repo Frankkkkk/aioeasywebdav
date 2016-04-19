@@ -228,7 +228,8 @@ class Client(object):
         """
         path = path.name if isinstance(path, File) else path
         response = await self._send('DELETE', path, 204)
-        await response.release()
+        if response:
+            await response.release()
 
     def upload(self, local_path_or_fileobj, remote_path):
         if isinstance(local_path_or_fileobj, str):
@@ -250,13 +251,17 @@ class Client(object):
         if length:
             pos = fileobj.seek(-overlap, os.SEEK_CUR) + start
             tail = fileobj.read()
-            rsp = await self._send('GET', remote_file.name, (200,206), headers={"Range": "bytes=%d-%d"%(pos,pos+overlap-1)})
-            read = await rsp.content.read()
-            if read == tail:
-                valid = True
-            else:
-                fileobj.seek(0)
-            await rsp.release()
+            rsp = None
+            try:
+                rsp = await self._send('GET', remote_file.name, (200,206), headers={"Range": "bytes=%d-%d"%(pos,pos+overlap-1)})
+                read = await rsp.content.read()
+                if read == tail:
+                    valid = True
+                else:
+                    fileobj.seek(0)
+            finally:
+                if rsp:
+                    await rsp.release()
         return valid
 
     async def _download_stream(self, local_path, part_path, remote_file, start, end, progress_callback = None, enabled_event = None):
