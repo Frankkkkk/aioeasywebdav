@@ -97,7 +97,16 @@ class ProgressHandler(object):
     @abstractmethod
     async def done_callback(self, error):
         """
+        Called when the download task is finished
         :param (str | None) error: Error string if there was an issue or None
+        :return: None
+        """
+        pass
+
+    @abstractmethod
+    async def verifying_callback(self):
+        """
+        Called when the download transfer is complete and about to be verified
         :return: None
         """
         pass
@@ -106,7 +115,7 @@ class ProgressHandler(object):
 class Client(object):
 
     def __init__(self, url=None, host=None, port=0, auth=None, username=None, password=None,
-                 protocol='http', verify_ssl=True, path=None, cert=None, max_connections=75):
+                 protocol='http', verify_ssl=True, path=None, cert=None, max_connections=65):
         self._max_connections = max_connections
 
         self.basepath = ''
@@ -390,26 +399,28 @@ class Client(object):
 
             partfiles = [part for part, dl_size in responses]
 
-            local_temp = local_path + TEMP_NAME
-            if not expected_length or \
-                    (sum([os.path.getsize(f) for f in partfiles]) == expected_length and len(partfiles) == len(chunks)):
-                error = None
-                if len(chunks) > 1:
-                    await loop.run_in_executor(None, self.join_parts, local_temp, partfiles)
-                else:
-                    os.rename(partfiles[0], local_temp)
+            if expected_length == 0:
+                error = "Null file reported"
+            else:
+                local_temp = local_path + TEMP_NAME
+                if sum([os.path.getsize(f) for f in partfiles]) == expected_length and len(partfiles) == len(chunks):
+                    error = None
+                    if len(chunks) > 1:
+                        await loop.run_in_executor(None, self.join_parts, local_temp, partfiles)
+                    else:
+                        os.rename(partfiles[0], local_temp)
 
-            if remote_file.checksum:
-                kind,hash = remote_file.checksum.split(":")
-                local_hash = None
-                if kind == 'MD5':
-                    local_hash = await loop.run_in_executor(None, self.md5, local_temp)
-                if local_hash != hash:
-                    error = "Invalid Checksum, expected: %s" % str(remote_file.checksum)
-                    os.rename(local_temp, local_path+".invalid")
+                if remote_file.checksum:
+                    kind,hash = remote_file.checksum.split(":")
+                    local_hash = None
+                    if kind == 'MD5':
+                        local_hash = await loop.run_in_executor(None, self.md5, local_temp)
+                    if local_hash != hash:
+                        error = "Invalid Checksum, expected: %s" % str(remote_file.checksum)
+                        os.rename(local_temp, local_path+".invalid")
 
-            if not error:
-                os.rename(local_temp, local_path)
+                if not error:
+                    os.rename(local_temp, local_path)
 
         except Exception as ex:
             tb = __import__('traceback').format_exc()
