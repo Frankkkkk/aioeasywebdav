@@ -411,6 +411,8 @@ class Client(object):
                         os.rename(partfiles[0], local_temp)
 
                 if remote_file.checksum:
+                    if isinstance(progress_handler, ProgressHandler):
+                        await progress_handler.verifying_callback()
                     kind,hash = remote_file.checksum.split(":")
                     local_hash = None
                     if kind == 'MD5':
