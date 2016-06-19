@@ -282,7 +282,9 @@ class Client(object):
         response = None
         finished = False
         pos = existing = 0
-        while not finished:
+        retry = 5
+        while not finished and retry:
+            retry -= 1
             try:
                 exists = os.path.exists(part_path)
                 mode = 'r+b' if exists else 'w+b'
@@ -332,7 +334,8 @@ class Client(object):
 
             except Exception as ex:
                 await asyncio.sleep(3) # Rate limiting
-                raise  # somewhere to breakpoint
+                if not retry:
+                    raise  # somewhere to breakpoint
             finally:
                 if response:
                     response.close()
