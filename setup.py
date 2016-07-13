@@ -3,10 +3,11 @@ import functools
 from setuptools import setup, find_packages
 from setuptools.command.test import test as TestCommand
 
-_IN_PACKAGE_DIR = functools.partial(os.path.join, "aioeasywebdav")
-
-with open(_IN_PACKAGE_DIR("__version__.py")) as version_file:
+with open(os.path.join(os.path.dirname(__file__), "aioeasywebdav", "__version__.py")) as version_file:
     exec(version_file.read())
+
+with open(os.path.join(os.path.dirname(__file__), "README.md")) as readme_file:
+    DOC=readme_file.read()
 
 class Tox(TestCommand):
     user_options = [('tox-args=', 'a', "Arguments to pass to tox")]
@@ -34,8 +35,9 @@ setup(
         "Programming Language :: Python :: 3.5",
         ],
     description="A straight-forward WebDAV client, ported from easywebdav to use aiohttp.",
+    long_description=DOC,
     license="ISC",
-    author="Andrew Leech, previously Amnon Grossman",
+    author="Andrew Leech",
     author_email="andrew@alelec.net",
     url="http://github.com/andrewleech/aioeasywebdav",
     version=__version__,  # noqa
