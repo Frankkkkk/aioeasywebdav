@@ -1,7 +1,8 @@
-aioEasyWebDAV: A WebDAV Client for Python 3.5 asyncio
-=====================================================
+aioEasyWebDAV: A WebDAV Client for asyncio  
+===========================================
 
-This is am aiohttp port of the requests-based EasyWebDAV ( http://github.com/amnong/easywebdav ).
+This project started as a port of the requests-based EasyWebDAV ( http://github.com/amnong/easywebdav ) to asyncio on Python 3.5.
+It has since been extended with additional features.
 
 
 Features
@@ -12,6 +13,10 @@ Features
 * Uploading and downloading files
 * Directory listing
 * Support for client side SSL certificates
+* Fragmented download (multiple chunks in simultaneous streams)
+* MD5 checksum validation when used with OwnCloud/Nextcloud webdav
+* Progress tracking/reporting via callback system   
+
 
 Installation
 ------------
@@ -58,10 +63,10 @@ Using clientside SSL certificate
 --------------------------------
 
     webdav = aioeasywebdav.connect('secure.example.net',
-                                username='user',
-                                password='pass',
-                                protocol='https',
-                                cert="/path/to/your/certificate.pem")
+                                   username='user',
+                                   password='pass',
+                                   protocol='https',
+                                   cert="/path/to/your/certificate.pem")
     # Do some stuff:
     print(await webdav.ls())
 

@@ -1,15 +1,8 @@
-import platform
-
-python_version, _, __ = platform.python_version_tuple()
-if python_version == '2':
-    from StringIO import StringIO
-else:
-    from io import StringIO
-
+from io import BytesIO
 from . import TestCase
 
 class Tests(TestCase):
-    content = '123\n123\n'
+    content = b'123\n123\n'
 
     def test__cd_cwd(self):
         self._create_dir('one')
@@ -126,7 +119,7 @@ class Tests(TestCase):
         self._assert_local_file(path, self.content)
     def test__download_stream(self):
         self._create_file('file', self.content)
-        sio = StringIO()
+        sio = BytesIO()
         self.client.download('file', sio)
         self.assertEqual(self.content, sio.getvalue())
 
@@ -146,7 +139,7 @@ class Tests(TestCase):
         self.client.upload(path, '/two/file')
         self._assert_file('two/file', self.content)
     def test__upload_stream(self):
-        sio = StringIO()
+        sio = BytesIO()
         sio.write(self.content)
         sio.seek(0)
         self.client.upload(sio, 'file')

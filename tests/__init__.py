@@ -1,4 +1,5 @@
 import os
+import sys
 import unittest
 import atexit
 import subprocess
@@ -7,9 +8,10 @@ import requests
 import time
 import shutil
 import tempfile
+import asyncio
 from functools import partial
 
-import easywebdav
+import aioeasywebdav
 
 SERVER_USERNAME = 'testuser'
 SERVER_PASSWORD = SERVER_USERNAME
@@ -22,7 +24,7 @@ _server_process = None
 _server_path = None
 _client = None
 def init():
-    global _initialized, _init_failed, _server_process, _server_path, _client
+    global _initialized, _init_failed, _server_process, _server_path, _client, _loop
     if _init_failed:
         raise unittest.SkipTest('Test session initialization failed')
     try:
@@ -36,7 +38,9 @@ def init():
             shutil.rmtree(_server_path)
         os.makedirs(_server_path)
         process_props = dict(
+            # args='{python} -m webdav --directory={path} --port={port} --username={username} --password={password}'.format(
             args='davserver -D {path} -u {username} -p {password} -P {port}'.format(
+                python=sys.executable,
                 path=_server_path,
                 username=SERVER_USERNAME,
                 password=SERVER_PASSWORD,
@@ -56,8 +60,10 @@ def init():
         # Ensure server is running
         ensure_server_initialized()
 
+        _loop = asyncio.get_event_loop()
+
         # Create client
-        _client = easywebdav.connect(
+        _client = aioeasywebdav.connect(
             host='localhost',
             port=SERVER_PORT,
             username=SERVER_USERNAME,
@@ -101,8 +107,10 @@ class TestCase(unittest.TestCase):
         init()
         self.client = ClientProxy(self, _client)
         self.client.cd('/')
+
     def tearDown(self):
         self._reset()
+
     def _reset(self, dir=None):
         dir = dir or _server_path
         for name in os.listdir(dir):
@@ -112,41 +120,52 @@ class TestCase(unittest.TestCase):
                 os.rmdir(path)
                 continue
             os.remove(path)
+
     def _path(self, path):
         return os.path.join(_server_path, path)
+
     def _create_dir(self, *paths):
         for p in paths:
             os.makedirs(self._path(p))
+
     def _list_dir(self, path):
         return os.listdir(self._path(path))
-    def _create_file(self, path, contents='Dummy content\n'):
-        with open(self._path(path), 'w') as f:
+
+    def _create_file(self, path, contents=b'Dummy content\n'):
+        with open(self._path(path), 'wb') as f:
             f.write(contents)
+
     def _read_file(self, path):
-        with open(self._path(path)) as f:
+        with open(self._path(path), 'rb') as f:
             return f.read()
+
     def _assert_dir(self, path):
         path = self._path(path.lstrip('/'))
         assert os.path.isdir(path), 'Expected directory does not exist: ' + path
+
     def _assert_file(self, path, contents=None):
         path = self._path(path)
         assert os.path.isfile(path), 'Expected file does not exist: ' + path
         if contents:
             self._assert_local_file(path, contents)
+
     def _assert_local_file(self, absolute_path, contents=None):
-        with open(absolute_path) as f:
+        with open(absolute_path, 'rb') as f:
             self.assertEqual(contents, f.read())
+
     def _assert_doesnt_exist(self, path):
         assert not os.path.exists(self._path(path)), 'Path should not have existed, but exists: ' + path
-    def _local_file(self, contents='Dummy content\n'):
+
+    def _local_file(self, contents=b'Dummy content\n'):
         ''' Create a temporary local file and return its path. The file will be
         deleted at the end of the test. '''
         handle, path = tempfile.mkstemp()
         if contents is not None:
-            with open(path, 'w') as f:
+            with open(path, 'wb') as f:
                 f.write(contents)
         self.addCleanup(partial(os.close, handle))
         return path
+
     def _local_path(self):
         ''' Get a temporary non-existent path. '''
         handle, path = tempfile.mkstemp()
@@ -171,7 +190,10 @@ class MethodProxy(object):
         self.__method__ = method
     def __call__(self, *args, **kwargs):
         cwd_before = self.__client__.cwd
-        result = self.__method__(*args, **kwargs)
+        if inspect.iscoroutinefunction(self.__method__):
+            result = asyncio.get_event_loop().run_until_complete(self.__method__(*args, **kwargs))
+        else:
+            result = self.__method__(*args, **kwargs)
         cwd_after = self.__client__.cwd
         self.__test__.assertEqual(cwd_before, cwd_after,
             'CWD has changed during method "{}":\n  Before: {}\n  After:  {}'

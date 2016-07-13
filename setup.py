@@ -1,13 +1,32 @@
 import os
 import functools
 from setuptools import setup, find_packages
+from setuptools.command.test import test as TestCommand
 
 _IN_PACKAGE_DIR = functools.partial(os.path.join, "aioeasywebdav")
 
 with open(_IN_PACKAGE_DIR("__version__.py")) as version_file:
     exec(version_file.read())
 
-properties = dict(
+class Tox(TestCommand):
+    user_options = [('tox-args=', 'a', "Arguments to pass to tox")]
+    def initialize_options(self):
+        TestCommand.initialize_options(self)
+        self.tox_args = None
+    def finalize_options(self):
+        TestCommand.finalize_options(self)
+        self.test_args = []
+        self.test_suite = True
+    def run_tests(self):
+        #import here, cause outside the eggs aren't loaded
+        import tox
+        import shlex
+        args = self.tox_args
+        if args:
+            args = shlex.split(self.tox_args)
+        tox.cmdline(args=args)
+
+setup(
     name="aioeasywebdav",
     classifiers = [
         "Development Status :: 4 - Beta",
@@ -23,19 +42,11 @@ properties = dict(
     packages=find_packages(exclude=["tests"]),
     data_files = [],
     install_requires=[
-        "aiohttp",
+        "aiohttp", "six"
         ],
+    tests_require=['tox'],
+    cmdclass={'test': Tox},
     entry_points=dict(
         console_scripts=[],
         ),
     )
-
-# Properties for development environments
-if "aioeasywebdav_DEV" in os.environ:
-    properties["install_requires"].append((
-        "nose",
-        "yanc",
-        "PyWebDAV",
-        ))
-
-setup(**properties)

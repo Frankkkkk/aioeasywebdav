@@ -2,6 +2,7 @@ import os
 import ssl
 import time
 import shutil
+import logging
 import hashlib
 import asyncio
 import aiohttp
@@ -40,10 +41,10 @@ def prop(elem, name, default=None, ns='{DAV:}'):
     return default if child is None else child.text
 
 
-def elem2file(elem, basepath=''):
+def elem2file(elem, baseurl='', basepath=''):
     length = prop(elem, 'getcontentlength', 0)
     return File(
-        unquote(prop(elem, 'href').replace(basepath, '')),
+        unquote(prop(elem, 'href').replace(baseurl, '').replace(basepath, '')),
         int(length) if length else 0,
         prop(elem, 'getlastmodified', ''),
         prop(elem, 'creationdate', ''),
@@ -117,6 +118,7 @@ class Client(object):
 
     def __init__(self, url=None, host=None, port=0, auth=None, username=None, password=None,
                  protocol='http', verify_ssl=True, path=None, cert=None, max_connections=65):
+        self.log = logging.getLogger("%s.%s" % (self.__class__.__module__, self.__class__.__name__))
         self._max_connections = max_connections
 
         self.basepath = ''
@@ -208,7 +210,7 @@ class Client(object):
         response = await self._send('MKCOL', path, expected_codes)
         await response.release()
 
-    def mkdirs(self, path):
+    async def mkdirs(self, path):
         dirs = [d for d in path.split('/') if d]
         if not dirs:
             return
@@ -218,7 +220,7 @@ class Client(object):
         try:
             for dir in dirs:
                 try:
-                    self.mkdir(dir, safe=True)
+                    await self.mkdir(dir, safe=True)
                 except Exception as e:
                     if e.actual_code == 409:
                         raise
@@ -253,6 +255,7 @@ class Client(object):
 
     async def _upload(self, fileobj, remote_path, **kwargs):
         async with self.limit_files:
+            loop = asyncio.get_event_loop()
             local_hash = await loop.run_in_executor(None, self._md5, fileobj)
         headers = {"OC-Checksum" : "MD5:%s" % local_hash}
         response = await self._send('PUT', remote_path, (200, 201, 204), data=fileobj, headers=headers, **kwargs)
@@ -286,26 +289,30 @@ class Client(object):
         while not finished and retry:
             retry -= 1
             try:
-                exists = os.path.exists(part_path)
-                mode = 'r+b' if exists else 'w+b'
-
                 if enabled_event:
                     await enabled_event.wait()
 
-                async with self.limit_files:
-                    with open(part_path, mode) as fileobj:
+                if isinstance(local_path, str):
+                    exists = os.path.exists(part_path)
+                    mode = 'r+b' if exists else 'w+b'
 
-                        if exists:
-                            await self._check_existing_download(fileobj, remote_file, start)
-                        pos = existing = fileobj.tell()
-                        await progress_callback(part_path, pos)
-                        req_start = start + pos
-                        if req_start >= end:
-                            finished = True
+                    async with self.limit_files:
+                        with open(part_path, mode) as fileobj:
+
+                            if exists:
+                                await self._check_existing_download(fileobj, remote_file, start)
+                            pos = existing = fileobj.tell()
+                            if progress_callback:
+                                await progress_callback(part_path, pos)
+                            req_start = start + pos
+                            if req_start >= end:
+                                finished = True
+                else:
+                    req_start = start
 
                 if not isinstance(end, int) or req_start < end:
 
-                    header = {"Range": "bytes=%s-%s"%(req_start,end)}
+                    header = {"Range": "bytes=%s-%s" % (req_start, end)}
                     response = await self._send('GET', remote_file.name, (200,206), chunked=True, headers=header)
 
                     while True:
@@ -321,16 +328,24 @@ class Client(object):
                             finished = True
                             break
 
-                        self._rate_notify(local_path, len(chunk))
+                        self._rate_notify(str(local_path), len(chunk))
 
-                        async with self.limit_files:
-                            with open(part_path, 'r+b') as fileobj:
-                                fileobj.seek(pos)
-                                length = len(chunk)
-                                fileobj.write(chunk)
-                                pos += length
-                                if progress_callback:
-                                    await progress_callback(part_path, pos)
+                        if isinstance(local_path, str):
+                            async with self.limit_files:
+                                with open(part_path, 'r+b') as fileobj:
+                                    fileobj.seek(pos)
+                                    length = len(chunk)
+                                    fileobj.write(chunk)
+                                    pos += length
+                                    if progress_callback:
+                                        await progress_callback(part_path, pos)
+                        else:
+                            length = len(chunk)
+                            local_path.write(chunk)
+                            pos += length
+                            if progress_callback:
+                                await progress_callback(part_path, pos)
+
 
             except Exception as ex:
                 await asyncio.sleep(3) # Rate limiting
@@ -367,7 +382,7 @@ class Client(object):
         fileobj.seek(start)
         return hash_md5.hexdigest()
 
-    async def download(self, local_path, remote_file, progress_handler = None, enabled_event = None):
+    async def download(self, remote_file, local_path, progress_handler = None, enabled_event = None):
         """
         :param str local_path: path to write local file
         :param File remote_file: remote file description as returned by ls
@@ -381,20 +396,36 @@ class Client(object):
         loop = asyncio.get_event_loop()
 
         try:
-            dirname = os.path.dirname(local_path)
-            if not os.path.exists(dirname):
-                os.makedirs(dirname)
+            if isinstance(remote_file, str):
+                # Lookup remote file details
+                remote_file = (await self.ls(remote_file))[0]
 
             expected_length = remote_file.size
 
-            chunksize = (10*1000*1000)
-            chunks = [(idx, rng, rng + chunksize-1) for idx, rng in enumerate(range(0, remote_file.size, chunksize))]
+            chunks = []
+            range_details = None
 
-            if chunks:
+            if isinstance(local_path, str):
+                # Download to local filename in multiple part files
 
-                partname = "%s.{}%s" % (local_path, TEMP_NAME)
-                chunks[-1] = (chunks[-1][0],chunks[-1][1], expected_length)
-                range_details = [(partname.format(str(i)),start,end) for i,start,end in chunks]
+                dirname = os.path.dirname(local_path)
+                if not dirname:
+                    dirname = '.'
+                if not os.path.exists(dirname):
+                    os.makedirs(dirname)
+
+                chunksize = (10*1000*1000)
+                chunks = [(idx, rng, rng + chunksize-1) for idx, rng in enumerate(range(0, remote_file.size, chunksize))]
+
+                if chunks:
+                    partname = "%s.{}%s" % (local_path, TEMP_NAME)
+                    chunks[-1] = (chunks[-1][0],chunks[-1][1], expected_length)
+                    range_details = [(partname.format(str(i)),start,end) for i,start,end in chunks]
+
+            else:  # Assume local_path is a file-like object to stream into
+                range_details = [("stream", 0, remote_file.size)]
+
+            if range_details:
 
                 if isinstance(progress_handler, ProgressHandler):
                     async def progress_callback(part_path, cur_length):
@@ -412,29 +443,30 @@ class Client(object):
             if expected_length == 0:
                 error = "Null file reported"
             else:
-                local_temp = local_path + TEMP_NAME
-                if sum([os.path.getsize(f) for f in partfiles]) == expected_length and len(partfiles) == len(chunks):
-                    error = None
-                    if len(chunks) > 1:
-                        async with self.limit_files:
-                            await loop.run_in_executor(None, self.join_parts, local_temp, partfiles)
-                    else:
-                        os.rename(partfiles[0], local_temp)
+                if isinstance(local_path, str):  # Check and re-assemble part files
+                    local_temp = local_path + TEMP_NAME
+                    if sum([os.path.getsize(f) for f in partfiles]) == expected_length and len(partfiles) == len(chunks):
+                        error = None
+                        if len(chunks) > 1:
+                            async with self.limit_files:
+                                await loop.run_in_executor(None, self.join_parts, local_temp, partfiles)
+                        else:
+                            os.rename(partfiles[0], local_temp)
 
-                if remote_file.checksum:
-                    if isinstance(progress_handler, ProgressHandler):
-                        await progress_handler.verifying_callback()
-                    kind,hash = remote_file.checksum.split(":")
-                    local_hash = None
-                    if kind == 'MD5':
-                        async with self.limit_files:
-                            local_hash = await loop.run_in_executor(None, self.md5, local_temp)
-                    if local_hash != hash:
-                        error = "Invalid Checksum, expected: %s" % str(remote_file.checksum)
-                        os.rename(local_temp, local_path+".invalid")
+                    if remote_file.checksum:
+                        if isinstance(progress_handler, ProgressHandler):
+                            await progress_handler.verifying_callback()
+                        kind, hash = remote_file.checksum.split(":")
+                        local_hash = None
+                        if kind == 'MD5':
+                            async with self.limit_files:
+                                local_hash = await loop.run_in_executor(None, self.md5, local_temp)
+                        if local_hash != hash:
+                            error = "Invalid Checksum, expected: %s" % str(remote_file.checksum)
+                            os.rename(local_temp, local_path+".invalid")
 
-                if not error:
-                    os.rename(local_temp, local_path)
+                    if not error:
+                        os.rename(local_temp, local_path)
 
         except Exception as ex:
             tb = __import__('traceback').format_exc()
@@ -476,7 +508,7 @@ class Client(object):
 
         tree = xml.fromstring(await response.read())
         await response.release()
-        entries = [elem2file(elem, self.basepath) for elem in tree.findall('{DAV:}response')]
+        entries = [elem2file(elem, self.baseurl, self.basepath) for elem in tree.findall('{DAV:}response')]
         return entries
 
     async def exists(self, remote_path):
