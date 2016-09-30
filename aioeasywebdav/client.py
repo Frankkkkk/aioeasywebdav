@@ -207,8 +207,8 @@ class Client(object):
 
     async def mkdir(self, path, safe=False):
         expected_codes = 201 if not safe else (201, 301, 405)
-        response = await self._send('MKCOL', path, expected_codes)
-        await response.release()
+        async with (await self._send('MKCOL', path, expected_codes)):
+            pass
 
     async def mkdirs(self, path):
         dirs = [d for d in path.split('/') if d]
@@ -232,8 +232,8 @@ class Client(object):
     async def rmdir(self, path, safe=False):
         path = str(path).rstrip('/') + '/'
         expected_codes = 204 if not safe else (204, 404)
-        response = await self._send('DELETE', path, expected_codes)
-        await response.release()
+        async with (await self._send('DELETE', path, expected_codes)):
+            pass
 
     async def delete(self, path):
         """
@@ -241,9 +241,8 @@ class Client(object):
         :return: None
         """
         path = path.name if isinstance(path, File) else path
-        response = await self._send('DELETE', path, 204)
-        if response:
-            await response.release()
+        async with (await self._send('DELETE', path, 204)):
+            pass
 
     async def upload(self, local_path_or_fileobj, remote_path):
         if isinstance(local_path_or_fileobj, str):
@@ -258,8 +257,8 @@ class Client(object):
             loop = asyncio.get_event_loop()
             local_hash = await loop.run_in_executor(None, self._md5, fileobj)
         headers = {"OC-Checksum" : "MD5:%s" % local_hash}
-        response = await self._send('PUT', remote_path, (200, 201, 204), data=fileobj, headers=headers, **kwargs)
-        await response.release()
+        async with (await self._send('PUT', remote_path, (200, 201, 204), data=fileobj, headers=headers, **kwargs)):
+            pass
 
     async def _check_existing_download(self, fileobj, remote_file, start):
         overlap = 16
@@ -268,21 +267,16 @@ class Client(object):
         if length:
             pos = fileobj.seek(-overlap, os.SEEK_CUR) + start
             tail = fileobj.read()
-            rsp = None
-            try:
-                rsp = await self._send('GET', remote_file.name, (200,206), headers={"Range": "bytes=%d-%d"%(pos,pos+overlap-1)})
+            async with (await self._send(
+                    'GET', remote_file.name, (200,206), headers={"Range": "bytes=%d-%d"%(pos,pos+overlap-1)})) as rsp:
                 read = await rsp.content.read()
                 if read == tail:
                     valid = True
                 else:
                     fileobj.seek(0)
-            finally:
-                if rsp:
-                    await rsp.release()
         return valid
 
     async def _download_stream(self, local_path, part_path, remote_file, start, end, progress_callback = None, enabled_event = None):
-        response = None
         finished = False
         pos = existing = 0
         retry = 5
@@ -313,49 +307,41 @@ class Client(object):
                 if not isinstance(end, int) or req_start < end:
 
                     header = {"Range": "bytes=%s-%s" % (req_start, end)}
-                    response = await self._send('GET', remote_file.name, (200,206), chunked=True, headers=header)
+                    async with (await self._send(
+                            'GET', remote_file.name, (200,206), chunked=True, headers=header)) as response:
 
-                    while True:
-                        if enabled_event and not enabled_event.is_set():
-                            if response:
-                                response.close()
-                                await response.release()
-                                response = None
-                            await asyncio.sleep(3) # Rate limiting
-                            break
-                        chunk = await response.content.read(DOWNLOAD_CHUNK_SIZE_BYTES)
-                        if not chunk:
-                            finished = True
-                            break
+                        while True:
+                            if enabled_event and not enabled_event.is_set():
+                                await asyncio.sleep(3) # Rate limiting
+                                break
+                            chunk = await response.content.read(DOWNLOAD_CHUNK_SIZE_BYTES)
+                            if not chunk:
+                                finished = True
+                                break
 
-                        self._rate_notify(str(local_path), len(chunk))
+                            self._rate_notify(str(local_path), len(chunk))
 
-                        if isinstance(local_path, str):
-                            async with self.limit_files:
-                                with open(part_path, 'r+b') as fileobj:
-                                    fileobj.seek(pos)
-                                    length = len(chunk)
-                                    fileobj.write(chunk)
-                                    pos += length
-                                    if progress_callback:
-                                        await progress_callback(part_path, pos)
-                        else:
-                            length = len(chunk)
-                            local_path.write(chunk)
-                            pos += length
-                            if progress_callback:
-                                await progress_callback(part_path, pos)
+                            if isinstance(local_path, str):
+                                async with self.limit_files:
+                                    with open(part_path, 'r+b') as fileobj:
+                                        fileobj.seek(pos)
+                                        length = len(chunk)
+                                        fileobj.write(chunk)
+                                        pos += length
+                                        if progress_callback:
+                                            await progress_callback(part_path, pos)
+                            else:
+                                length = len(chunk)
+                                local_path.write(chunk)
+                                pos += length
+                                if progress_callback:
+                                    await progress_callback(part_path, pos)
 
 
             except Exception as ex:
                 await asyncio.sleep(3) # Rate limiting
                 if not retry:
                     raise  # somewhere to breakpoint
-            finally:
-                if response:
-                    response.close()
-                    await response.release()
-                    response = None
         return part_path, pos - existing
 
     @staticmethod
@@ -499,20 +485,18 @@ class Client(object):
                 <a:getcontenttype/>
             </a:prop>
         </a:propfind>"""
-        response = await self._send('PROPFIND', remote_path, (207, 301), headers=headers, data=checksum_prop)
+        async with (await self._send(
+                'PROPFIND', remote_path, (207, 301), headers=headers, data=checksum_prop)) as response:
+            # Redirect
+            if response.status == 301:
+                url = urlparse(response.headers['location'])
+                return self.ls(url.path)
+            tree = xml.fromstring(await response.read())
 
-        # Redirect
-        if response.status == 301:
-            url = urlparse(response.headers['location'])
-            return self.ls(url.path)
-
-        tree = xml.fromstring(await response.read())
-        await response.release()
         entries = [elem2file(elem, self.baseurl, self.basepath) for elem in tree.findall('{DAV:}response')]
         return entries
 
     async def exists(self, remote_path):
-        response = await self._send('HEAD', remote_path, (200, 301, 404))
-        ret =  True if response.status != 404 else False
-        await response.release()
+        async with (await self._send('HEAD', remote_path, (200, 301, 404))) as response:
+            ret =  True if response.status != 404 else False
         return ret
