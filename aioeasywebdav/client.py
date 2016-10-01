@@ -146,6 +146,7 @@ class Client(object):
 
         self.session = aiohttp.ClientSession(connector=conn, auth=auth)
 
+        self._closed = False
         self._rate_ave_period = 2  # approx period in seconds over which the download rate it averaged
         self._download_rates = {}
         self._rate_tracking = {}
@@ -153,9 +154,16 @@ class Client(object):
 
         self.limit_files = asyncio.Semaphore(MAX_OPEN_FILES)
 
+    def __del__(self):
+        self.close()
+
+    def close(self):
+        self.session.close()
+        self._closed = True
+
     async def _rate_calc(self):
         prev = time.time() - self._rate_ave_period
-        while True:
+        while not self._closed:
             now = time.time()
             for name, downloaded in self._rate_tracking.items():
                 # assert isinstance(entry, self._rate_tracking_entry)
