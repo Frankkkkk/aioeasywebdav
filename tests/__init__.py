@@ -18,19 +18,18 @@ SERVER_PASSWORD = SERVER_USERNAME
 SERVER_PORT = 28080
 SERVER_URL = 'http://localhost:{}'.format(SERVER_PORT)
 
-_initialized = False
 _init_failed = False
 _server_process = None
 _server_path = None
-_client = None
+_loop = None
+
 def init():
-    global _initialized, _init_failed, _server_process, _server_path, _client, _loop
+    global _init_failed, _server_process, _server_path, _loop
+
+    _client = None
     if _init_failed:
         raise unittest.SkipTest('Test session initialization failed')
     try:
-        if _initialized:
-            return
-
         # Create server
         output('Starting WebDAV server')
         _server_path = '/tmp/easywebdav_tests'#tempfile.mkdtemp()
@@ -45,15 +44,15 @@ def init():
                 username=SERVER_USERNAME,
                 password=SERVER_PASSWORD,
                 port=SERVER_PORT,
-                ),
+            ),
             shell=True,
-            )
+        )
         if "WEBDAV_LOGS" not in os.environ:
             process_props.update(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE,
-                )
+            )
         _server_process = subprocess.Popen(**process_props)
         atexit.register(terminate_server)
 
@@ -62,18 +61,10 @@ def init():
 
         _loop = asyncio.get_event_loop()
 
-        # Create client
-        _client = aioeasywebdav.connect(
-            host='localhost',
-            port=SERVER_PORT,
-            username=SERVER_USERNAME,
-            password=SERVER_PASSWORD,
-            )
-
-        _initialized = True
     except:
         _init_failed = True
         raise
+    return _client
 
 def ensure_server_initialized():
     output('Waiting for WebDAV server to start up...')
@@ -103,12 +94,30 @@ def output(msg, *args, **kwargs):
     print(msg)
 
 class TestCase(unittest.TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         init()
-        self.client = ClientProxy(self, _client)
+
+    @classmethod
+    def tearDownClass(cls):
+        asyncio.get_event_loop().run_until_complete(asyncio.sleep(3))
+
+
+    def setUp(self):
+        # Create client
+        self._client = aioeasywebdav.connect(
+            host='localhost',
+            port=SERVER_PORT,
+            username=SERVER_USERNAME,
+            password=SERVER_PASSWORD,
+        )
+
+        self.client = ClientProxy(self, self._client)
         self.client.cd('/')
 
     def tearDown(self):
+        if self._client:
+            self._client.close()
         self._reset()
 
     def _reset(self, dir=None):
