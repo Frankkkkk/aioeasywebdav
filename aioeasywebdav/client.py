@@ -136,8 +136,6 @@ class Client(object):
 
         sslcontext = None
         if cert:
-            self.session.cert = cert
-
             sslcontext = ssl.create_default_context(cafile=cert)
         conn = aiohttp.TCPConnector(ssl_context=sslcontext, verify_ssl=verify_ssl, limit=self._max_connections)
 
